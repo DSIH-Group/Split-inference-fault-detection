@@ -2,199 +2,476 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+import matplotlib.pyplot as plt
 import pandas as pd
-import os
-import time
 import numpy as np
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import os
 
-# 1. DATASET: Multi-Modal Fusion (Sensors + Actuators)
-class DroneMultiModalDataset(Dataset):
-    def __init__(self, manifest_file):
+seed = 42
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+np.random.seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+class HILDataset(Dataset):
+    def __init__(self, dataset_file, window_size=64, stride=32):
         self.samples = []
-        if not os.path.exists(manifest_file):
-            print(f"Warning: {manifest_file} not found.")
-            return
+        with open(dataset_file, 'r') as f:
+            paths = [line.strip() for line in f if line.strip() and 'TestInfo.csv' not in line]
 
-        print(f"Loading data from {manifest_file}...")
-        with open(manifest_file, 'r') as f:
-            for line in f:
-                base_path = line.strip()
-                if not base_path or 'TestInfo.csv' in base_path: continue
+        for path in paths:
+            if not os.path.exists(path): continue
+            path_upper = path.upper()
+
+            # Reading through the path name to identify the fault type. 
+            if 'HIL-NOFAULT' in path_upper: fault_class = 0
+            elif 'MOTOR' in path_upper: fault_class = 1
+            elif 'PROP' in path_upper: fault_class = 2
+            else: continue
+
+            test_info_path = os.path.join(path, 'TestInfo.csv')
+            if not os.path.exists(test_info_path): continue
+
+            # Identifying the injection time. 
+            test_info = pd.read_csv(test_info_path, index_col=0, header=None).T
+            fault_time_sec = float(test_info['Fault injection time'].iloc[0])
+
+            sensor_file = self._find_file(path, 'sensor_combined_0.csv')
+            actuator_file = self._find_file(path, 'actuator_outputs_0.csv')
+
+            # If there is either a sensor or actuator .csv file that is missing, we skip the testcase entirly. 
+            if not sensor_file or not actuator_file: continue
+
+
+            # Sorting the actuator and sensor .csv files by timestamp
+            actuator_dataframe = pd.read_csv(actuator_file).sort_values('timestamp')
+            sensor_dataframe = pd.read_csv(sensor_file).sort_values('timestamp')
+
+            '''
+            Since the actuator and sensor .csv files were generating using sensors with different sample rates,
+            We merge a given row in the sensor .csv file with the closest row from the actuator .csv file to 
+            make a single row in merged_dataframe. 
+            ''' 
+            merged_dataframe = pd.merge_asof(sensor_dataframe, actuator_dataframe, on='timestamp', direction='nearest')
+
+            # Dropping the timestamp column
+            timestamps, data = merged_dataframe['timestamp'].values, merged_dataframe.drop(columns=['timestamp']).values
+            
+            # Finding the injection row 
+            injection_row = np.searchsorted(timestamps, timestamps[0] + (fault_time_sec * 1e6))
+            
+            folder_id = os.path.basename(path.rstrip('/'))
+
+            '''
+            Now that we have the injection row, we break down the merged_dataframe into 64-row windows. 
+            Each window is then assigned a label. If the window occurs before the injection fault, 
+            it's given a label of 0(representing healthy). 
+            
+            Any windows at or after the injection row are labelled as the fault class. 
+            On the otherhand, all windows before the injection row are labelled as healthy. 
+            '''
+            for start in range(0, len(merged_dataframe) - window_size, stride):
+                end = start + window_size
                 
-                sensor_file = self._find_file(base_path, 'sensor_combined_0.csv')
-                actuator_file = self._find_file(base_path, 'actuator_outputs_0.csv')
+                # Creating the label for a given window. 
+                label = 0 if end < injection_row else fault_class
+
+                # If the window we are using contains the injection row, 
+                if start < injection_row < end: continue
+
+                '''
+                Normalizing all values in a given window column by subtracting the value by the column mean 
+                and dividing the value by the column standard deviation.
+                '''
+                window = (data[start:end, :] - data[start:end, :].mean(axis=0)) / (data[start:end, :].std(axis=0) + 1e-6)
                 
-                if sensor_file and actuator_file:
-                    if 'HIL-NoFault' in base_path: label = 0
-                    elif 'HIL_Motor' in base_path: label = 1
-                    elif 'HIL_Prop' in base_path: label = 2
-                    else: continue
-                    self.samples.append((sensor_file, actuator_file, label))
+                # Transposing the window so that it can be processed by the encoder. Also storing additional meta data about the window. 
+                self.samples.append((window.T, label, folder_id, fault_class))
 
     def _find_file(self, directory, suffix):
         log_dir = os.path.join(directory, 'Log')
-        if not os.path.exists(log_dir): log_dir = directory 
-        if os.path.isdir(log_dir):
-            for file in os.listdir(log_dir):
-                if file.endswith(suffix): return os.path.join(log_dir, file)
+        target = log_dir if os.path.exists(log_dir) else directory
+
+        for file in os.listdir(target):
+            if file.endswith(suffix): return os.path.join(target, file)
         return None
 
-    def __len__(self): return len(self.samples)
+    def __len__(self): 
+        return len(self.samples)
 
-    def __getitem__(self, idx):
-        s_path, a_path, label = self.samples[idx]
-        s_data = pd.read_csv(s_path).iloc[:12, :10].values
-        a_data = pd.read_csv(a_path).iloc[:12, :8].values
-        combined = np.hstack([s_data, a_data])
-        
-        # Z-Score Normalization for numerical stability
-        mean = combined.mean(axis=0)
-        std = combined.std(axis=0) + 1e-6
-        norm_data = (combined - mean) / std
-        
-        return torch.tensor(norm_data.T, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+    def __getitem__(self, index):
 
-# 2. ARCHITECTURE
-class SharedEncoder(nn.Module):
-    def __init__(self):
+        window, label, folder_id, fault_class = self.samples[index]
+
+        return torch.tensor(window, dtype=torch.float32), torch.tensor(label, dtype=torch.long), folder_id, torch.tensor(fault_class, dtype=torch.long)
+
+# Architecture classes #
+
+class Residual1D(nn.Module):
+    def __init__(self, channels, dilation):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(18, 32, kernel_size=3, padding=1), nn.ReLU(),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 12, 16) 
-        )
-    def forward(self, x): return self.conv(x)
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.batch1 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.batch2 = nn.BatchNorm1d(channels)
+        self.relu = nn.ReLU()
 
-class Decoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc = nn.Sequential(nn.Linear(16, 64 * 12), nn.ReLU())
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose1d(64, 32, kernel_size=3, padding=1), nn.ReLU(),
-            nn.ConvTranspose1d(32, 18, kernel_size=3, padding=1) 
-        )
     def forward(self, x):
-        return self.deconv(self.fc(x).view(-1, 64, 12))
+        residual = x
+        out = self.relu(self.batch1(self.conv1(x)))
+        out = self.batch2(self.conv2(out))
+        return self.relu(out + residual)
 
-class SentryHead(nn.Module):
+class Predictor(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64), 
+            nn.ReLU()
+        )
+
+        # Creates a series of dialated convolutions to help with identifying patterns in the dataset. 
+        # The purpose of using these dialated convolutions is to help view 
+        self.res_stack = nn.Sequential(
+            Residual1D(64, dilation=1),
+            Residual1D(64, dilation=2),
+            Residual1D(64, dilation=4)
+        )
+
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1), # Acts as the equivalent of global average pooling in CNNs for models that work with 1D data. 
+            nn.Flatten(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3), # Adding dropout as a form of regularization
+            nn.Linear(128, 3)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.res_stack(x)
+        return self.classifier(x)
+
+class Sentry(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc = nn.Sequential(nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 1))
-    def forward(self, x): return self.fc(x)
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1), # Acts as the equivalent of global average pooling in CNNs for models that work with 1D data. 
+            nn.Flatten(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2), # Adding dropout as a form of regularization
+            nn.Linear(32, 2)
+        )
 
-class SpecialistHead(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
-    def forward(self, x): return self.fc(x)
+    def forward(self, x):
+        return self.classifier(x)
 
-# 3. PIPELINE SETUP
-train_ds = DroneMultiModalDataset('train_split.txt')
-test_ds = DroneMultiModalDataset('test_split.txt')
-train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
-test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
+# Helper function to help with calcualting the total lost 
+def calculate_tc_metrics(tc_map):
+    if not tc_map: return 0.0, 0.0
+    correct = 0; total_loss = 0
+    for fid in tc_map:
+        winning_vote = np.bincount(tc_map[fid]['preds']).argmax()
+        if winning_vote == tc_map[fid]['f_class']: correct += 1
+        total_loss += sum(tc_map[fid]['losses']) / len(tc_map[fid]['losses'])
+    return 100 * (correct / len(tc_map)), total_loss / len(tc_map)
 
-encoder, sentry = SharedEncoder(), SentryHead()
-specialist, decoder = SpecialistHead(), Decoder()
+# Setting up the dataloaders for each of the train, validation and test datasets. 
+train_dataset = HILDataset('train_split.txt')
+val_dataset = HILDataset('val_split.txt', stride=64)
+test_dataset = HILDataset('test_split.txt', stride=64)
 
-# --- DYNAMIC WEIGHT CALCULATION ---
-print("\nCalculating Class Weights to fix imbalance...")
-counts = [0, 0, 0]
-for _, y in train_ds: counts[y.item()] += 1
-total_tr = sum(counts)
-spec_weights = torch.tensor([total_tr/c if c > 0 else 1.0 for c in counts], dtype=torch.float32)
+train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True,num_workers=6,pin_memory=True)
+val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False,num_workers=6,pin_memory=True)
+test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False,num_workers=6,pin_memory=True)
 
-# Sentry weight: Ratio of Normal to Faults
-s_weight = torch.tensor([counts[0] / (counts[1] + counts[2])], dtype=torch.float32)
+# Both the sentry and predictor model will be using CrossEntropyLoss
+criterion = nn.CrossEntropyLoss(reduction='none')
 
-# --- PHASE 1: JOINT TRAINING (30 Epochs) ---
-print("\n" + "="*70)
-print(f"{'Epoch':<8} | {'Total Loss':<12} | {'Diag Acc %':<12} | {'Recon MSE':<12}")
-print("-" * 70)
 
-opt1 = optim.Adam(list(encoder.parameters()) + list(specialist.parameters()) + list(decoder.parameters()), lr=1e-4)
-criterion_diag = nn.CrossEntropyLoss(weight=spec_weights)
-criterion_recon = nn.MSELoss()
+# Setting up the predictor model. 
+model = Predictor(in_channels=train_dataset[0][0].shape[0])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+history = {'t_loss': [], 'v_loss': [], 't_acc': [], 'v_acc': []}
 
-for epoch in range(30):
-    encoder.train(); specialist.train(); decoder.train()
-    r_loss, r_acc, r_recon = 0.0, 0, 0.0
-    for x, y in train_loader:
-        opt1.zero_grad()
-        feat = encoder(x)
-        out_diag, out_recon = specialist(feat), decoder(feat)
-        loss = criterion_diag(out_diag, y) + (0.5 * criterion_recon(out_recon, x))
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-        opt1.step()
-        r_loss += loss.item(); r_recon += criterion_recon(out_recon, x).item()
-        r_acc += (out_diag.argmax(1) == y).sum().item()
-    print(f"{epoch+1:<8} | {r_loss/len(train_loader):<12.4f} | {100*r_acc/len(train_ds):<12.2f} | {r_recon/len(train_loader):<12.6f}")
-
-# --- PHASE 2: SENTRY CALIBRATION (10 Epochs) ---
-print("\nPHASE 2: Calibrating Sentry Gatekeeper...")
-for p in encoder.parameters(): p.requires_grad = False
-opt2 = optim.Adam(sentry.parameters(), lr=1e-4)
-criterion_sentry = nn.BCEWithLogitsLoss(pos_weight=s_weight)
-
+# Phase 1: Training the predictor and encoder model on the training dataset
+print(f"\n--- Starting Phase 1: Training the predictor and encoder model ---")
 for epoch in range(10):
+    model.train()
+    training_map = {} # Map for storing information about the training loss and accuracy for each epoch. 
+
+    for windows, labels, folder_ids, fault_classes in train_dataloader:
+        windows = windows.to(device)
+        labels = labels.to(device)
+        optimizer.zero_grad()
+        out = model(windows)
+        loss = criterion(out, labels)
+        loss.mean().backward(); 
+        optimizer.step()
+
+        ls, preds = loss.detach().cpu().numpy(), out.argmax(1).cpu().numpy()
+        for i, folder_id in enumerate(folder_ids):
+
+            if folder_id not in training_map:
+                training_map[folder_id] = {'preds': [], 'f_class': fault_classes[i].item(), 'losses': []}
+
+            training_map[folder_id]['preds'].append(preds[i])
+            training_map[folder_id]['losses'].append(ls[i])
+
+    model.eval()
+    validation_map = {} # Map for storing information about the validation loss and accuracy for each epoch. 
+
+    with torch.no_grad():
+        for windows, labels, folder_ids, fault_classes in val_dataloader:
+            windows = windows.to(device)
+            labels = labels.to(device)
+            out = model(windows)
+            loss = criterion(out, labels)
+            ls, preds = loss.cpu().numpy(), out.argmax(1).cpu().numpy()
+
+            for i, folder_id in enumerate(folder_ids):
+                if folder_id not in validation_map:
+                    validation_map[folder_id] = {'preds': [], 'f_class': fault_classes[i].item(), 'losses': []}
+
+                validation_map[folder_id]['preds'].append(preds[i])
+                validation_map[folder_id]['losses'].append(ls[i])
+
+    training_acc, training_loss = calculate_tc_metrics(training_map)
+    validation_acc, validation_loss = calculate_tc_metrics(validation_map)
+    history['t_loss'].append(training_loss); history['v_loss'].append(validation_loss)
+    history['t_acc'].append(training_acc); history['v_acc'].append(validation_acc)
+    print(f"Epoch {epoch+1:02d} | Train Loss: {training_loss:.4f} | Train Acc: {training_acc:.2f}% | Val Loss: {validation_loss:.4f} | Val Acc: {validation_acc:.2f}%")
+
+
+# Phase 2: Training the sentry model on the dataset
+print(f"\n--- Starting Phase 2: Training the sentry model ---")
+
+# Freezing the predictor and encoder model. 
+for param in model.parameters():
+    param.requires_grad = False
+model.eval()
+
+# Configuring and training the sentry model. 
+sentry = Sentry()
+sentry = sentry.to(device)
+sentry_optimizer = optim.AdamW(sentry.parameters(), lr=1e-3, weight_decay=1e-4)
+
+for epoch in range(5):
     sentry.train()
-    for x, y in train_loader:
-        opt2.zero_grad()
-        binary_y = (y > 0).float().unsqueeze(1)
-        loss = criterion_sentry(sentry(encoder(x)), binary_y)
-        loss.backward(); opt2.step()
+    for windows, labels, folder_ids, fault_classes in train_dataloader:
+        windows = windows.to(device)
+        labels = labels.to(device)
+        sentry_optimizer.zero_grad()
+        labels_binary = (labels > 0).long()
 
-# --- PHASE 3: EVALUATION ---
-print("\n" + "="*70)
-print("PHASE 3: SPLIT INFERENCE DEPLOYMENT")
-print("="*70)
-encoder.eval(); sentry.eval(); specialist.eval()
+        with torch.no_grad():
+            features = model.res_stack(model.stem(windows))
 
-triggers, diag_ok, total = 0, 0, 0
-sentry_true, sentry_pred = [], []
-system_true, system_pred = [], []
-SENTRY_THRESHOLD = 0.5 
+        out = sentry(features)
+        loss = criterion(out, labels_binary)
+        loss.mean().backward(); 
+        sentry_optimizer.step()
+
+    sentry.eval()
+    sentry_validation_map = {}
+
+    with torch.no_grad():
+        for windows, labels, folder_ids, fault_classes in val_dataloader:
+            windows = windows.to(device)
+            labels = labels.to(device)
+            labels_binary = (labels > 0).long()
+            features = model.res_stack(model.stem(windows))
+            out = sentry(features)
+            loss = criterion(out, labels_binary)
+
+            ls, preds = loss.cpu().numpy(), out.argmax(1).cpu().numpy()
+            
+            for i, folder_id in enumerate(folder_ids):    
+                binary_faultclass = 1 if fault_classes[i].item() > 0 else 0
+                if folder_id not in sentry_validation_map:
+                    sentry_validation_map[folder_id] = {'preds': [], 'f_class': binary_faultclass, 'losses': []}
+                
+                sentry_validation_map[folder_id]['preds'].append(preds[i]) 
+                sentry_validation_map[folder_id]['losses'].append(ls[i])
+
+    sentry_acc, sentry_loss = calculate_tc_metrics(sentry_validation_map)
+    print(f"Phase 2 Epoch {epoch+1:02d} | Val Loss: {sentry_loss:.4f} | Val TC Acc: {sentry_acc:.2f}%")
+
+
+# Phase 3: Fine tuning the predictor model
+print(f"\n--- Phase 3: Fine tuning the predictor model ---")
+
+# Freezing the sentry and classifier models
+for param in model.classifier.parameters():
+    param.requires_grad = True
+
+for param in sentry.parameters():
+    param.requires_grad = False
+
+
+# Setting up an optimizer with a low learning rate to prevent the predictor from forgetting the phase 1 training. 
+phase3_optimizer = optim.AdamW(model.classifier.parameters(), lr=1e-4, weight_decay=1e-4)
+
+# Fine tuning the predictor model
+for epoch in range(5):
+    model.classifier.train()
+    model.stem.eval()
+    model.res_stack.eval()
+
+    for windows, labels, folder_ids, fault_classes in train_dataloader:
+        windows = windows.to(device)
+        labels = labels.to(device)
+        phase3_optimizer.zero_grad()
+
+        with torch.no_grad():
+            features = model.res_stack(model.stem(windows))
+
+        out = model.classifier(features)
+        loss = criterion(out, labels)
+        loss.mean().backward()
+        phase3_optimizer.step()
+
+    model.classifier.eval()
+    predictor_validation_map_phase3 = {}
+
+    with torch.no_grad():
+        for windows, labels, folder_ids, fault_classes in val_dataloader:
+            windows = windows.to(device)
+            labels = labels.to(device)
+            features = model.res_stack(model.stem(windows))
+            out = model.classifier(features)
+            loss = criterion(out, labels)
+
+            preds, ls = out.argmax(1).cpu().numpy(), loss.cpu().numpy()
+            for i, folder_id in enumerate(folder_ids):
+                if folder_id not in predictor_validation_map_phase3:
+                    predictor_validation_map_phase3[folder_id] = {'preds': [], 'f_class': fault_classes[i].item(), 'losses': []}
+                
+                predictor_validation_map_phase3[folder_id]['preds'].append(preds[i])
+                predictor_validation_map_phase3[folder_id]['losses'].append(ls[i])
+
+    phase3_acc, phase3_loss = calculate_tc_metrics(predictor_validation_map_phase3)
+    print(f"Phase 3 Epoch {epoch+1:02d} | Val Loss: {phase3_loss:.4f} | Val TC Acc: {phase3_acc:.2f}%")
+
+
+# Phase 4: Evaluating the entire architecture the test dataset
+print(f"\n--- Phase 4: Evaluation of the architecture on unseen test data ({len(test_dataset.samples)} samples) ---")
+
+model.eval()
+sentry.eval()
+
+# Maps for storing accuracy and loss of the predictor and encoder and sentry models respectively. 
+test_predictor_map = {}
+test_sentry_map = {}
 
 with torch.no_grad():
-    for x, y in test_loader:
-        total += 1
-        feat = encoder(x)
+    for windows, labels, folder_ids, fault_classes in test_dataloader:
+        windows, labels = windows.to(device), labels.to(device)
         
-        y_val = y.item()
-        sentry_true.append(1 if y_val > 0 else 0)
-        system_true.append(y_val)
+        features = model.res_stack(model.stem(windows))
+        predictor_out = model.classifier(features)
+        predictor_loss = criterion(predictor_out, labels)
+        predictor_preds = predictor_out.argmax(1).cpu().numpy()
+        
+        sentry_out = sentry(features)
+        labels_binary = (labels > 0).long()
+        sentry_loss = criterion(sentry_out, labels_binary)
+        sentry_preds = sentry_out.argmax(1).cpu().numpy()
 
-        prob = torch.sigmoid(sentry(feat)).item()
-        if prob > SENTRY_THRESHOLD:
-            triggers += 1
-            sentry_pred.append(1)
-            pred = specialist(feat).argmax(1).item()
-            system_pred.append(pred)
-            if pred == y_val: diag_ok += 1
-        else:
-            sentry_pred.append(0)
-            system_pred.append(0)
+        for i, folder_id in enumerate(folder_ids):
+            if folder_id not in test_predictor_map: 
+                test_predictor_map[folder_id] = {'preds': [], 'f_class': fault_classes[i].item(), 'losses': []}
 
-# --- RESULTS ---
-print(f"Bandwidth Saved: {100 * (1 - (triggers/total)):.2f}%")
-print(f"Final Accuracy : {100 * diag_ok/triggers if triggers > 0 else 0:.2f}%")
+            test_predictor_map[folder_id]['preds'].append(predictor_preds[i])
+            test_predictor_map[folder_id]['losses'].append(predictor_loss[i].cpu().numpy())
+            
+            binary_faultclass = 1 if fault_classes[i].item() > 0 else 0
 
-print("\n" + "="*50)
-print(" SENTRY CONFUSION MATRIX (Edge Layer)")
-print("="*50)
-cm_s = confusion_matrix(sentry_true, sentry_pred, labels=[0, 1])
-print(f"{'':<15} | {'Pred Norm':<15} | {'Pred Fault':<15}")
-print(f"{'Actual Norm':<15} | {cm_s[0,0]:<15} | {cm_s[0,1]:<15}")
-print(f"{'Actual Fault':<15} | {cm_s[1,0]:<15} | {cm_s[1,1]:<15}")
+            if folder_id not in test_sentry_map:
+                test_sentry_map[folder_id] = {'preds': [], 'f_class': binary_faultclass, 'losses': []}
 
-print("\n" + "="*50)
-print(" SYSTEM CONFUSION MATRIX (Overall)")
-print("="*50)
-cm_sys = confusion_matrix(system_true, system_pred, labels=[0, 1, 2])
-print(f"{'':<15} | {'P: Norm':<10} | {'P: Motor':<10} | {'P: Prop':<10}")
-print(f"{'Actual Norm':<15} | {cm_sys[0,0]:<10} | {cm_sys[0,1]:<10} | {cm_sys[0,2]:<10}")
-print(f"{'Actual Motor':<15} | {cm_sys[1,0]:<10} | {cm_sys[1,1]:<10} | {cm_sys[1,2]:<10}")
-print(f"{'Actual Prop':<15} | {cm_sys[2,0]:<10} | {cm_sys[2,1]:<10} | {cm_sys[2,2]:<10}")
+            test_sentry_map[folder_id]['preds'].append(sentry_preds[i])
+            test_sentry_map[folder_id]['losses'].append(sentry_loss[i].cpu().numpy())
+
+final_predictor_acc, final_predictor_loss = calculate_tc_metrics(test_predictor_map)
+final_sentry_acc, final_sentry_loss = calculate_tc_metrics(test_sentry_map)
+
+print(f"Final Test Specialist Acc: {final_predictor_acc:.2f}% | Loss: {final_predictor_loss:.4f}")
+print(f"Final Test Sentry Acc:     {final_sentry_acc:.2f}% | Loss: {final_sentry_loss:.4f}")
+
+
+# Plotting and evaluation 
+
+# Phase 1 accuracy and loss curves between training and validation dataset
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+ax1.plot(history['t_loss'], label='Train'); ax1.plot(history['v_loss'], label='Val'); ax1.set_title('Phase 1 Loss'); ax1.legend()
+ax2.plot(history['t_acc'], label='Train TC Acc'); ax2.plot(history['v_acc'], label='Val TC Acc'); ax2.set_title('Phase 1 Accuracy'); ax2.legend()
+plt.savefig('phase1_training_curves.png')
+print("Saved: phase1_training_curves.png")
+plt.close()
+
+# Generating Confusion matrices across all phases of training and the testing phase. 
+fig, axes = plt.subplots(1, 5, figsize=(28, 6))
+
+# Phase 1 confusion matrix
+predictor_trues = [validation_map[f]['f_class'] for f in validation_map]
+predictor_preds = [np.bincount(validation_map[f]['preds']).argmax() for f in validation_map]
+ConfusionMatrixDisplay.from_predictions(predictor_trues, predictor_preds, display_labels=['NoFault', 'Motor', 'Prop'], cmap='Blues', ax=axes[0])
+axes[0].set_title("Phase 1: Initial Predictor trainin")
+
+# Phase 2 confusion matrix
+sentry_trues = [sentry_validation_map[f]['f_class'] for f in sentry_validation_map]
+sentry_preds = [np.bincount(sentry_validation_map[f]['preds']).argmax() for f in sentry_validation_map]
+ConfusionMatrixDisplay.from_predictions(sentry_trues, sentry_preds, display_labels=['Normal', 'Anomaly'], cmap='Greens', ax=axes[1])
+axes[1].set_title("Phase 2: Sentry training")
+
+# Phase 3 confusion matrix
+predictor3_trues = [predictor_validation_map_phase3[f]['f_class'] for f in predictor_validation_map_phase3]
+predictor3_preds = [np.bincount(predictor_validation_map_phase3[f]['preds']).argmax() for f in predictor_validation_map_phase3]
+ConfusionMatrixDisplay.from_predictions(predictor3_trues, predictor3_preds, display_labels=['NoFault', 'Motor', 'Prop'], cmap='Purples', ax=axes[2])
+axes[2].set_title("Phase 3: Fine-Tuned Predictor")
+
+# Phase 4 confusion matrix
+test_sentry_trues = [test_sentry_map[f]['f_class'] for f in test_sentry_map]
+test_sentry_preds = [np.bincount(test_sentry_map[f]['preds']).argmax() for f in test_sentry_map]
+ConfusionMatrixDisplay.from_predictions(test_sentry_trues, test_sentry_preds, display_labels=['Normal', 'Anomaly'], cmap='Greens', ax=axes[3])
+axes[3].set_title("Final Test: Sentry")
+
+# Phase 5 confusion matrix
+test_predictor_trues = [test_predictor_map[f]['f_class'] for f in test_predictor_map]
+test_predictor_preds = [np.bincount(test_predictor_map[f]['preds']).argmax() for f in test_predictor_map]
+ConfusionMatrixDisplay.from_predictions(test_predictor_trues, test_predictor_preds, display_labels=['NoFault', 'Motor', 'Prop'], cmap='Reds', ax=axes[4])
+axes[4].set_title("Final Test: Predictor")
+
+
+
+plt.tight_layout()
+plt.savefig('confusion_matrices.png')
+print("Saved: confusion_matrices.png")
+plt.close()
+
+
+# Saving the .pt files containing the weights for different parts of the architecture. 
+print("\n Phase 5: Saving Component Weights")
+
+encoder_state = {
+    'stem': model.stem.state_dict(),
+    'res_stack': model.res_stack.state_dict()
+}
+
+torch.save(encoder_state, 'encoder_weights.pt')
+torch.save(sentry.state_dict(), 'sentry_weights.pt')
+torch.save(model.classifier.state_dict(), 'specialist_weights.pt')
+
+print("All model weights have been exported for deployment.")
+
+
+    
+
+

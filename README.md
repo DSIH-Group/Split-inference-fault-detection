@@ -1,4 +1,4 @@
-**Split inference for real-time fault identification in drones**
+*Split inference for real-time fault identification in drones*
 
 Below is a breakdown of the folders and files inside of this project. 
 

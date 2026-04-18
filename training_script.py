@@ -402,7 +402,7 @@ with torch.no_grad():
 final_predictor_acc, final_predictor_loss = calculate_tc_metrics(test_predictor_map)
 final_sentry_acc, final_sentry_loss = calculate_tc_metrics(test_sentry_map)
 
-print(f"Final Test Specialist Acc: {final_predictor_acc:.2f}% | Loss: {final_predictor_loss:.4f}")
+print(f"Final Test Predictor Acc: {final_predictor_acc:.2f}% | Loss: {final_predictor_loss:.4f}")
 print(f"Final Test Sentry Acc:     {final_sentry_acc:.2f}% | Loss: {final_sentry_loss:.4f}")
 
 
@@ -467,7 +467,7 @@ encoder_state = {
 
 torch.save(encoder_state, 'encoder_weights.pt')
 torch.save(sentry.state_dict(), 'sentry_weights.pt')
-torch.save(model.classifier.state_dict(), 'specialist_weights.pt')
+torch.save(model.classifier.state_dict(), 'predictor_weights.pt')
 
 print("All model weights have been exported for deployment.")
 

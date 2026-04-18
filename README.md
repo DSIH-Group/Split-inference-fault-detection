@@ -1,3 +1,5 @@
+**Split inference for real-time fault identification in drones**
+
 Below is a breakdown of the folders and files inside of this project. 
 
 - training_script.py->a .py file used to train the machine learning architecture and generate .pt files to pass through the ONNX framework. 

@@ -51,7 +51,7 @@ def evaluate_models(encoder_path, sentry_path, predictor_path, test_loader, pref
     for window, label, folder_id, fault_class in test_loader:
         window_np = window.numpy()
         
-        for i in range(x_np.shape[0]):
+        for i in range(window_np.shape[0]):
             single_window = x_np[i:i+1]
             start_time = time.time()
             
@@ -78,7 +78,6 @@ def evaluate_models(encoder_path, sentry_path, predictor_path, test_loader, pref
             total_inference_time += (end_time - start_time)
             total_windows += 1
 
-            folder_id = folder_ids[i]
             if folder_id not in onnx_test_map:
                 onnx_test_map[folder_id] = {'preds': [], 'f_class': fault_class[i].item()}
             onnx_test_map[folder_id]['preds'].append(final_prediction)
